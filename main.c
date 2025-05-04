@@ -1,101 +1,154 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
+#include <errno.h>
 
-void getAvailableDisplays(char displays[][50], int *count) {
-    FILE *fp;
-    char buffer[256];
+#define MAX_DISPLAYS 10
+#define DISPLAY_NAME_LEN 50
+#define CMD_BUFFER_LEN 256
+#define MODELINE_LEN 256
 
-    fp = popen("xrandr", "r");
+typedef enum {
+    SUCCESS = 0,
+    ERR_SYSTEM_CALL,
+    ERR_INVALID_INPUT,
+    ERR_NO_DISPLAYS
+} ErrorCode;
+
+typedef struct {
+    char name[DISPLAY_NAME_LEN];
+} Display;
+
+ErrorCode getAvailableDisplays(Display displays[], size_t *count) {
+    FILE *fp = popen("xrandr", "r");
     if (fp == NULL) {
-        printf("Failed to run xrandr command.\n");
-        return;
+        perror("Failed to run xrandr command");
+        return ERR_SYSTEM_CALL;
     }
 
     printf("Available displays:\n");
     *count = 0;
-    while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+    char buffer[CMD_BUFFER_LEN];
+
+    while (fgets(buffer, sizeof(buffer), fp) != NULL && *count < MAX_DISPLAYS) {
         if (strstr(buffer, " connected") != NULL) {
-            sscanf(buffer, "%s", displays[*count]);
-            printf("[%d] %s\n", *count + 1, displays[*count]);
-            (*count)++;
+            if (sscanf(buffer, "%49s", displays[*count].name) == 1) {
+                printf("[%zu] %s\n", *count + 1, displays[*count].name);
+                (*count)++;
+            }
         }
     }
 
     pclose(fp);
+    return (*count == 0) ? ERR_NO_DISPLAYS : SUCCESS;
 }
 
-int main() {
-    int num1, num2, num3;
-    printf("Enter resolution width:\n");
-    scanf("%d", &num1);
-    printf("Enter resolution height:\n");
-    scanf("%d", &num2);
-    printf("Enter refresh rate in hz:\n");
-    scanf("%d", &num3);
+ErrorCode safeInputInt(const char *prompt, int *value) {
+    char input[32];
+    char *endptr;
+    long val;
 
-    char command[256];
-    sprintf(command, "cvt %d %d %d", num1, num2, num3);
-
-    FILE *fp;
-    char buffer[256];
-    char modeline[256];
-    char displayName[50];
-
-    fp = popen(command, "r");
-    if (fp == NULL) {
-        printf("Failed to run cvt command\n");
-        return 1;
+    printf("%s", prompt);
+    if (fgets(input, sizeof(input), stdin) == NULL) {
+        return ERR_INVALID_INPUT;
     }
 
+    errno = 0;
+    val = strtol(input, &endptr, 10);
+    if (errno != 0 || *endptr != '\n' || val < 0 || val > INT_MAX) {
+        return ERR_INVALID_INPUT;
+    }
+
+    *value = (int)val;
+    return SUCCESS;
+}
+
+ErrorCode executeCommand(const char *command) {
+    int status = system(command);
+    if (status != 0) {
+        fprintf(stderr, "Command failed: %s\n", command);
+        return ERR_SYSTEM_CALL;
+    }
+    return SUCCESS;
+}
+
+int main(void) {
+    int width, height, refresh_rate;
+    Display displays[MAX_DISPLAYS];
+    size_t display_count = 0;
+    ErrorCode ret = SUCCESS;
+
+    if (safeInputInt("Enter resolution width: ", &width) != SUCCESS ||
+        safeInputInt("Enter resolution height: ", &height) != SUCCESS ||
+        safeInputInt("Enter refresh rate in Hz: ", &refresh_rate) != SUCCESS) {
+        fprintf(stderr, "Invalid input parameters\n");
+        return ERR_INVALID_INPUT;
+    }
+
+    char modeline[MODELINE_LEN] = {0};
+    char command[CMD_BUFFER_LEN];
+    snprintf(command, sizeof(command), "cvt %d %d %d", width, height, refresh_rate);
+
+    FILE *fp = popen(command, "r");
+    if (fp == NULL) {
+        perror("Failed to run cvt command");
+        return ERR_SYSTEM_CALL;
+    }
+
+    char buffer[CMD_BUFFER_LEN];
     while (fgets(buffer, sizeof(buffer), fp) != NULL) {
         if (strncmp(buffer, "Modeline", 8) == 0) {
-            strcpy(modeline, buffer);
+            strncpy(modeline, buffer, sizeof(modeline) - 1);
             break;
         }
     }
     pclose(fp);
 
-    modeline[strcspn(modeline, "\n")] = 0;
-
-    char displays[10][50]; 
-    int count;
-    getAvailableDisplays(displays, &count);
-
-    int choice;
-    printf("Select a display by number: ");
-    scanf("%d", &choice);
-
-    if (choice < 1 || choice > count) {
-        printf("Invalid choice.\n");
-        return 1;
+    if (modeline[0] == '\0') {
+        fprintf(stderr, "No modeline found\n");
+        return ERR_SYSTEM_CALL;
     }
 
-    strcpy(displayName, displays[choice - 1]);
+    modeline[strcspn(modeline, "\n")] = '\0';
 
-    char modeName[50];
-    sscanf(modeline, "Modeline \"%[^\"]\"", modeName);
-    char addModeCommand[256];
-    sprintf(addModeCommand, "xrandr --newmode %s", modeline + 8);
+    if ((ret = getAvailableDisplays(displays, &display_count)) != SUCCESS) {
+        fprintf(stderr, "No available displays found\n");
+        return ret;
+    }
 
-    system(addModeCommand);
+    int choice;
+    printf("Select a display by number (1-%zu): ", display_count);
+    if (scanf("%d", &choice) != 1 || choice < 1 || choice > (int)display_count) {
+        fprintf(stderr, "Invalid choice\n");
+        return ERR_INVALID_INPUT;
+    }
 
-    char addModeDisplayCommand[256];
-    sprintf(addModeDisplayCommand, "xrandr --addmode %s %s", displayName, modeName);
-    system(addModeDisplayCommand);
+    char mode_name[DISPLAY_NAME_LEN] = {0};
+    if (sscanf(modeline, "Modeline \"%49[^\"]\"", mode_name) != 1) {
+        fprintf(stderr, "Failed to parse modeline\n");
+        return ERR_SYSTEM_CALL;
+    }
+
+    snprintf(command, sizeof(command), "xrandr --newmode %s", modeline + 8);
+    if ((ret = executeCommand(command)) != SUCCESS) return ret;
+
+    snprintf(command, sizeof(command), "xrandr --addmode %s %s", 
+             displays[choice - 1].name, mode_name);
+    if ((ret = executeCommand(command)) != SUCCESS) return ret;
 
     char apply;
-    printf("Do you want to apply the new resolution now? (y/n): ");
+    printf("Apply the new resolution now? (y/n): ");
     scanf(" %c", &apply);
-    
+
     if (apply == 'y' || apply == 'Y') {
-        char outputCommand[256];
-        sprintf(outputCommand, "xrandr --output %s --mode \"%s\"", displayName, modeName);
-        system(outputCommand);
-        printf("Resolution applied to %s.\n", displayName);
+        snprintf(command, sizeof(command), "xrandr --output %s --mode \"%s\"", 
+                 displays[choice - 1].name, mode_name);
+        if ((ret = executeCommand(command)) != SUCCESS) return ret;
+        printf("Resolution applied to %s.\n", displays[choice - 1].name);
     } else {
         printf("Changes have not been applied.\n");
     }
 
-    return 0;
+    return SUCCESS;
 }
